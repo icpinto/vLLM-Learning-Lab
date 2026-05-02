@@ -1,0 +1,9 @@
+[project]
+name = "vllm-learning-lab"
+version = "0.1.0"
+description = "Hands-on vLLM learning lab with Jupyter notebooks, benchmarks, stress tests, and dashboard"
+requires-python = ">=3.10"
+authors = [{ name = "vLLM Learning Lab" }]
+
+[tool.setuptools.packages.find]
+where = ["src"]

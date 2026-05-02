@@ -1,0 +1,20 @@
+model:
+  default_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  max_new_tokens: 128
+  temperature: 0.0
+  top_p: 1.0
+
+vllm_server:
+  base_url: http://localhost:8000/v1
+  host: 0.0.0.0
+  port: 8000
+  max_model_len: 2048
+  max_num_seqs: 16
+  gpu_memory_utilization: 0.85
+
+benchmark:
+  prompts:
+    - "Explain why GPU batching improves throughput in LLM inference."
+    - "Summarise the difference between CPU and GPU for deep learning."
+    - "Explain KV cache in transformer inference using a practical example."
+    - "What is PagedAttention and why does it matter?"
