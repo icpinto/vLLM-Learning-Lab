@@ -19,6 +19,13 @@ class GenerationResult:
     prompt_tokens: int
     output_tokens: int
     latency_s: float
+    end_to_end_latency_s: Optional[float] = None
+    tokenization_latency_s: Optional[float] = None
+    prefill_latency_s: Optional[float] = None
+    decode_latency_s: Optional[float] = None
+    time_to_first_token_s: Optional[float] = None
+    memory_allocated_mb: Optional[float] = None
+    memory_reserved_mb: Optional[float] = None
 
     @property
     def output_tokens_per_second(self) -> float:
@@ -53,12 +60,10 @@ def benchmark_transformers(
     prompts: List[str],
     max_new_tokens: int = 128,
     device: Optional[str] = None,
+    warmup: bool = True,
+    batch_size: int = 1,
 ) -> List[GenerationResult]:
-    """Run a simple sequential Transformers generate() benchmark.
-
-    This intentionally uses a plain loop so the baseline exposes the cost of naive
-    one-request-at-a-time inference.
-    """
+    """Run an improved Transformers benchmark with richer performance telemetry."""
     import torch
 
     if device is None:
@@ -66,33 +71,97 @@ def benchmark_transformers(
     model.to(device)
     model.eval()
 
+    is_cuda_device = str(device).startswith("cuda")
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    # Warm-up prevents one-time initialization overhead from polluting metrics.
+    if warmup and prompts:
+        warmup_inputs = tokenizer(prompts[0], return_tensors="pt").to(device)
+        with torch.inference_mode():
+            _ = model.generate(
+                **warmup_inputs,
+                max_new_tokens=1,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+            )
+        if is_cuda_device:
+            torch.cuda.synchronize()
+
     results: List[GenerationResult] = []
-    for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        prompt_tokens = int(inputs["input_ids"].shape[-1])
-        start = time.perf_counter()
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i : i + batch_size]
+
+        tokenization_start = time.perf_counter()
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
+        if is_cuda_device:
+            torch.cuda.synchronize()
+        tokenization_latency_s = time.perf_counter() - tokenization_start
+
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            prompt_lengths = attention_mask.sum(dim=1).tolist()
+        else:
+            prompt_lengths = [int(inputs["input_ids"].shape[-1])] * len(batch_prompts)
+
+        generation_start = time.perf_counter()
         with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=pad_token_id,
             )
-        if device == "cuda":
+        if is_cuda_device:
             torch.cuda.synchronize()
-        latency_s = time.perf_counter() - start
-        generated = outputs[0][prompt_tokens:]
-        output_text = tokenizer.decode(generated, skip_special_tokens=True)
-        results.append(
-            GenerationResult(
-                backend="transformers_sequential",
-                prompt=prompt,
-                output_text=output_text,
-                prompt_tokens=prompt_tokens,
-                output_tokens=int(generated.shape[-1]),
-                latency_s=latency_s,
+        generation_latency_s = time.perf_counter() - generation_start
+
+        one_token_start = time.perf_counter()
+        with torch.inference_mode():
+            _ = model.generate(
+                **inputs,
+                max_new_tokens=1,
+                do_sample=False,
+                pad_token_id=pad_token_id,
             )
-        )
+        if is_cuda_device:
+            torch.cuda.synchronize()
+        one_token_latency_s = time.perf_counter() - one_token_start
+
+        decode_start = time.perf_counter()
+        decoded_texts: List[str] = []
+        output_token_counts: List[int] = []
+        for row_idx, prompt_len in enumerate(prompt_lengths):
+            generated = outputs[row_idx][int(prompt_len) :]
+            decoded_texts.append(tokenizer.decode(generated, skip_special_tokens=True))
+            output_token_counts.append(int(generated.shape[-1]))
+        decode_latency_s = time.perf_counter() - decode_start
+
+        end_to_end_latency_s = tokenization_latency_s + generation_latency_s + decode_latency_s
+
+        mem_alloc_mb = mem_reserved_mb = None
+        if is_cuda_device:
+            mem_alloc_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            mem_reserved_mb = torch.cuda.max_memory_reserved() / (1024 * 1024)
+
+        for row_idx, prompt in enumerate(batch_prompts):
+            ttft_s = min(one_token_latency_s, generation_latency_s)
+            results.append(
+                GenerationResult(
+                    backend="transformers_batched" if batch_size > 1 else "transformers_sequential",
+                    prompt=prompt,
+                    output_text=decoded_texts[row_idx],
+                    prompt_tokens=int(prompt_lengths[row_idx]),
+                    output_tokens=output_token_counts[row_idx],
+                    latency_s=generation_latency_s,
+                    end_to_end_latency_s=end_to_end_latency_s,
+                    tokenization_latency_s=tokenization_latency_s,
+                    prefill_latency_s=ttft_s,
+                    decode_latency_s=max(generation_latency_s - one_token_latency_s, 0.0),
+                    time_to_first_token_s=ttft_s,
+                    memory_allocated_mb=mem_alloc_mb,
+                    memory_reserved_mb=mem_reserved_mb,
+                )
+            )
     return results
 
 
